@@ -2,6 +2,7 @@
  * PixelWar AI - Phase 1 MVP Backend
  * Port: 3001
  *
+ * x402 Payment Integration: HTTP 402 Payment Required flow
  * TODO: 替换为 Redis — 当前所有存储使用内存 Map 模拟
  */
 
@@ -12,6 +13,13 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ─────────────────────────────────────────────
+// x402 Payment Config
+// ─────────────────────────────────────────────
+const OWNER_WALLET_ADDRESS = process.env.OWNER_WALLET_ADDRESS || '0x0000000000000000000000000000000000000000';
+const PAYMENT_NETWORK = process.env.PAYMENT_NETWORK || 'base-sepolia';
+const PAYMENT_TOKEN = 'USDC';
+
+// ─────────────────────────────────────────────
 // In-Memory Store  (TODO: 替换为 Redis ioredis)
 // ─────────────────────────────────────────────
 /**
@@ -20,17 +28,14 @@ const PORT = process.env.PORT || 3001;
  * PixelData {
  *   owner     : string        — agent_id of current owner
  *   color     : string        — "#RRGGBB"
- *   price     : number        — current USDC price (simulated)
+ *   price     : number        — current USDC price
  *   timestamp : number        — Unix ms
  * }
- *
- * Redis 等效：HSET pixel:{x}:{y} owner <owner> color <color> price <price> timestamp <ts>
  */
 const canvasStore = new Map(); // TODO: 替换为 Redis Hash
 
 /**
  * Transaction ledger: Array<TxRecord>
- * 模拟经济流水，用于统计最活跃 agent、rebate 记录等
  */
 const txLedger = []; // TODO: 替换为 Redis List / Stream
 
@@ -73,6 +78,45 @@ function round6(n) {
   return Math.round(n * 1e6) / 1e6;
 }
 
+/**
+ * Calculate price for a pixel (fresh or overwrite).
+ */
+function calcPrice(existing) {
+  if (!existing) return INITIAL_PRICE;
+  return round6(existing.price * PRICE_MULTIPLIER);
+}
+
+/**
+ * Parse X-PAYMENT header.
+ * Accepts JSON or plain string tx_hash.
+ * Returns { tx_hash, raw } or null.
+ */
+function parsePaymentHeader(header) {
+  if (!header) return null;
+  try {
+    const parsed = JSON.parse(header);
+    return {
+      tx_hash: parsed.tx_hash || parsed.txHash || parsed.transaction_hash || header,
+      raw: parsed,
+    };
+  } catch {
+    // Treat as plain tx_hash string
+    return { tx_hash: header, raw: header };
+  }
+}
+
+/**
+ * Simplified payment verification.
+ * Phase 1: Accept any non-empty payment proof and record it.
+ * TODO: Phase 2 — call x402 facilitator to verify on-chain.
+ */
+function verifyPayment(paymentProof, expectedPriceUsdc) {
+  if (!paymentProof || !paymentProof.tx_hash) return false;
+  // Simplified: accept any proof with a non-empty tx_hash
+  // Real impl: verify tx on Base chain that transferred expectedPriceUsdc USDC
+  return true;
+}
+
 // ─────────────────────────────────────────────
 // Middleware
 // ─────────────────────────────────────────────
@@ -94,16 +138,20 @@ app.use((req, _res, next) => {
  * Simple health-check.
  */
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', store: 'in-memory', pixels: canvasStore.size });
+  res.json({
+    status: 'ok',
+    store: 'in-memory',
+    pixels: canvasStore.size,
+    payment: 'x402',
+    network: PAYMENT_NETWORK,
+    owner_wallet: OWNER_WALLET_ADDRESS,
+  });
 });
 
 /**
  * GET /pixels?page=1&limit=100
  *
  * Returns paginated list of all *occupied* pixels.
- * Default: page=1, limit=100 (max 10000)
- *
- * TODO: Redis — HSCAN pixel:* cursor COUNT limit
  */
 app.get('/pixels', (req, res) => {
   const page  = Math.max(1, parseInt(req.query.page  || '1',   10));
@@ -131,8 +179,6 @@ app.get('/pixels', (req, res) => {
  * GET /pixel/:x/:y
  *
  * Returns single pixel data. If unoccupied, returns default state.
- *
- * TODO: Redis — HGETALL pixel:{x}:{y}
  */
 app.get('/pixel/:x/:y', (req, res) => {
   const { valid, x, y } = validateCoords(req.params.x, req.params.y);
@@ -161,7 +207,14 @@ app.get('/pixel/:x/:y', (req, res) => {
  * POST /pixel/:x/:y
  * Body: { color: "#RRGGBB", agent_id: "string" }
  *
- * Claim or overwrite a pixel.
+ * x402 Payment Flow:
+ *
+ * Step 1 — No X-PAYMENT header:
+ *   → 402 Payment Required + { price_usdc, wallet_address, network, token, x, y }
+ *
+ * Step 2 — With X-PAYMENT header (tx_hash or JSON proof):
+ *   → Verify payment → Execute pixel claim
+ *   → 200 { success, x, y, color, owner, price_paid, ... }
  *
  * TODO: Redis — atomic Lua script for HGET + HSET + LPUSH ledger
  */
@@ -182,25 +235,65 @@ app.post('/pixel/:x/:y', (req, res) => {
 
   const key      = pixelKey(x, y);
   const existing = canvasStore.get(key);
-  const now      = Date.now();
+  const price_usdc = calcPrice(existing);
 
-  let price_paid;
+  // ── x402: Check for payment header ──
+  const paymentHeader = req.headers['x-payment'];
+
+  if (!paymentHeader) {
+    // ── STEP 1: Return 402 Payment Required ──
+    return res.status(402).json({
+      x402Version: 1,
+      error: 'Payment Required',
+      accepts: [
+        {
+          scheme: 'exact',
+          network: PAYMENT_NETWORK,
+          maxAmountRequired: String(Math.round(price_usdc * 1e6)), // in USDC base units (6 decimals)
+          resource: `${req.protocol}://${req.get('host')}${req.originalUrl}`,
+          description: `Claim pixel (${x}, ${y}) on PixelWar AI`,
+          mimeType: 'application/json',
+          payTo: OWNER_WALLET_ADDRESS,
+          maxTimeoutSeconds: 300,
+          asset: PAYMENT_TOKEN === 'USDC' && PAYMENT_NETWORK === 'base-sepolia'
+            ? '0x036CbD53842c5426634e7929541eC2318f3dCF7e'  // USDC on Base Sepolia
+            : PAYMENT_NETWORK === 'base'
+            ? '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'  // USDC on Base Mainnet
+            : '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+          extra: {
+            price_usdc,
+            wallet_address: OWNER_WALLET_ADDRESS,
+            network: PAYMENT_NETWORK,
+            token: PAYMENT_TOKEN,
+            name: 'PixelWar AI',
+          },
+        },
+      ],
+    });
+  }
+
+  // ── STEP 2: Validate payment and execute pixel claim ──
+  const paymentProof = parsePaymentHeader(paymentHeader);
+
+  if (!verifyPayment(paymentProof, price_usdc)) {
+    return res.status(402).json({
+      error: 'Invalid payment proof. Please retry with valid X-PAYMENT header.',
+      x402Version: 1,
+    });
+  }
+
+  const now = Date.now();
+  let price_paid = price_usdc;
   let rebate_to_previous_owner = 0;
   let treasury_cut = 0;
   let loot_cut = 0;
   let dev_cut = 0;
   let previousOwner = null;
 
-  if (!existing) {
-    // ── Fresh pixel: pay initial price ──
-    price_paid = INITIAL_PRICE;
-  } else {
-    // ── Overwrite: price escalates ──
+  if (existing) {
     previousOwner = existing.owner;
     const oldPrice = existing.price;
-
-    price_paid                = round6(oldPrice * PRICE_MULTIPLIER);
-    rebate_to_previous_owner  = round6(oldPrice * REBATE_RATIO);
+    rebate_to_previous_owner = round6(oldPrice * REBATE_RATIO);
     treasury_cut              = round6(oldPrice * TREASURY_RATIO);
     loot_cut                  = round6(oldPrice * LOOT_RATIO);
     dev_cut                   = round6(oldPrice * DEV_RATIO);
@@ -212,8 +305,9 @@ app.post('/pixel/:x/:y', (req, res) => {
     color,
     price: price_paid,
     timestamp: now,
+    tx_hash: paymentProof.tx_hash,
   };
-  canvasStore.set(key, newPixel); // TODO: 替换为 Redis HSET
+  canvasStore.set(key, newPixel);
 
   // ── Append to ledger ──
   txLedger.push({
@@ -221,12 +315,13 @@ app.post('/pixel/:x/:y', (req, res) => {
     buyer: agent_id.trim(),
     seller: previousOwner,
     price_paid,
+    tx_hash: paymentProof.tx_hash,
     rebate_to_previous_owner,
     treasury_cut,
     loot_cut,
     dev_cut,
     timestamp: now,
-  }); // TODO: 替换为 Redis LPUSH / XADD
+  });
 
   res.json({
     success: true,
@@ -234,6 +329,7 @@ app.post('/pixel/:x/:y', (req, res) => {
     color,
     owner: agent_id.trim(),
     price_paid,
+    tx_hash: paymentProof.tx_hash,
     rebate_to_previous_owner,
     treasury_cut,
     loot_cut,
@@ -243,14 +339,34 @@ app.post('/pixel/:x/:y', (req, res) => {
 });
 
 /**
+ * GET /price/:x/:y
+ *
+ * Returns the current price for a pixel (useful for agents before payment).
+ */
+app.get('/price/:x/:y', (req, res) => {
+  const { valid, x, y } = validateCoords(req.params.x, req.params.y);
+  if (!valid) {
+    return res.status(400).json({ error: 'Coordinates out of range (0–999)' });
+  }
+
+  const existing = canvasStore.get(pixelKey(x, y));
+  const price_usdc = calcPrice(existing);
+
+  res.json({
+    x, y,
+    price_usdc,
+    wallet_address: OWNER_WALLET_ADDRESS,
+    network: PAYMENT_NETWORK,
+    token: PAYMENT_TOKEN,
+    occupied: !!existing,
+    current_owner: existing ? existing.owner : null,
+  });
+});
+
+/**
  * GET /stats
  *
- * Returns:
- *  - total_occupied   : number of claimed pixels
- *  - most_expensive   : pixel with highest price
- *  - most_active      : agent with most purchase transactions
- *
- * TODO: Redis — sorted sets for leaderboards
+ * Returns aggregate stats.
  */
 app.get('/stats', (_req, res) => {
   const total_occupied = canvasStore.size;
@@ -285,6 +401,12 @@ app.get('/stats', (_req, res) => {
     most_active: most_active
       ? { agent_id: most_active, tx_count: maxCount }
       : null,
+    payment_info: {
+      protocol: 'x402',
+      network: PAYMENT_NETWORK,
+      token: PAYMENT_TOKEN,
+      owner_wallet: OWNER_WALLET_ADDRESS,
+    },
   });
 });
 
@@ -300,12 +422,15 @@ app.use((_req, res) => {
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`
-╔══════════════════════════════════════════╗
-║   PixelWar AI — Backend  MVP  Phase 1   ║
-║   Port    : ${PORT}                        ║
-║   Canvas  : ${CANVAS_SIZE}×${CANVAS_SIZE} pixels              ║
-║   Storage : In-Memory Map (Redis TODO)  ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════════╗
+║   PixelWar AI — Backend  MVP  Phase 1           ║
+║   Port    : ${PORT}                                ║
+║   Canvas  : ${CANVAS_SIZE}×${CANVAS_SIZE} pixels                  ║
+║   Storage : In-Memory Map (Redis TODO)          ║
+║   Payment : x402 / HTTP 402 Protocol            ║
+║   Network : ${PAYMENT_NETWORK.padEnd(30)}║
+║   Wallet  : ${OWNER_WALLET_ADDRESS.slice(0, 20)}...          ║
+╚══════════════════════════════════════════════════╝
   `);
 });
 
