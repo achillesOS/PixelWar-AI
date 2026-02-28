@@ -1,0 +1,27 @@
+{
+  "name": "pixelwar-agent-sdk",
+  "version": "1.0.0",
+  "description": "AI Agent SDK for PixelWar - participate in the pixel canvas battle with AI strategies",
+  "main": "agent_sdk.js",
+  "scripts": {
+    "start": "node example_agent.js",
+    "demo": "node example_agent.js",
+    "test": "node -e \"const c = require('./captcha'); const ch = c.generateChallenge(); console.log('Challenge:', ch); const r = c.solveChallenge(ch); console.log('Answer:', r); const v = c.verifyAnswer(ch.challenge_id, r); console.log('Verify:', v);\""
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "chalk": "^4.1.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": [
+    "pixelwar",
+    "ai-agent",
+    "sdk",
+    "blockchain",
+    "pixel"
+  ],
+  "author": "PixelWar AI Team",
+  "license": "MIT"
+}
