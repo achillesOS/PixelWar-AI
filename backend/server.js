@@ -8,6 +8,7 @@
 
 const express = require('express');
 const cors = require('cors');
+const { ethers } = require('ethers');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -18,6 +19,24 @@ const PORT = process.env.PORT || 3001;
 const OWNER_WALLET_ADDRESS = process.env.OWNER_WALLET_ADDRESS || '0x0000000000000000000000000000000000000000';
 const PAYMENT_NETWORK = process.env.PAYMENT_NETWORK || 'base-sepolia';
 const PAYMENT_TOKEN = 'USDC';
+const BASE_RPC_URL = process.env.BASE_RPC_URL || 'https://sepolia.base.org';
+
+// USDC contract addresses
+const USDC_ADDRESS = PAYMENT_NETWORK === 'base-mainnet'
+  ? '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+  : '0x036CbD53842c5426634e7929541eC2318f3dCF7e'; // base-sepolia
+
+const TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
+
+// RPC provider (lazy init)
+let _provider = null;
+function getProvider() {
+  if (!_provider) _provider = new ethers.JsonRpcProvider(BASE_RPC_URL);
+  return _provider;
+}
+
+// Track used tx hashes to prevent replay attacks
+const usedTxHashes = new Set();
 
 // ─────────────────────────────────────────────
 // In-Memory Store  (TODO: 替换为 Redis ioredis)
@@ -106,15 +125,67 @@ function parsePaymentHeader(header) {
 }
 
 /**
- * Simplified payment verification.
- * Phase 1: Accept any non-empty payment proof and record it.
- * TODO: Phase 2 — call x402 facilitator to verify on-chain.
+ * On-chain payment verification via Base RPC.
+ * Verifies:
+ *   1. tx exists and succeeded (status === 1)
+ *   2. USDC Transfer event: from=payer, to=OWNER_WALLET, amount>=expected
+ *   3. tx_hash not previously used (anti-replay)
+ *
+ * Returns { ok: boolean, reason?: string }
  */
-function verifyPayment(paymentProof, expectedPriceUsdc) {
-  if (!paymentProof || !paymentProof.tx_hash) return false;
-  // Simplified: accept any proof with a non-empty tx_hash
-  // Real impl: verify tx on Base chain that transferred expectedPriceUsdc USDC
-  return true;
+async function verifyPaymentOnChain(paymentProof, expectedPriceUsdc) {
+  if (!paymentProof || !paymentProof.tx_hash) {
+    return { ok: false, reason: 'missing tx_hash' };
+  }
+  const txHash = paymentProof.tx_hash;
+
+  // Anti-replay
+  if (usedTxHashes.has(txHash)) {
+    return { ok: false, reason: 'tx_hash already used' };
+  }
+
+  // If owner wallet is zero address, skip on-chain check (dev mode)
+  if (OWNER_WALLET_ADDRESS === '0x0000000000000000000000000000000000000000') {
+    console.warn('[payment] OWNER_WALLET_ADDRESS not set — skipping on-chain verify (dev mode)');
+    usedTxHashes.add(txHash);
+    return { ok: true };
+  }
+
+  try {
+    const provider = getProvider();
+    const receipt = await provider.getTransactionReceipt(txHash);
+
+    if (!receipt) return { ok: false, reason: 'tx not found on chain' };
+    if (receipt.status !== 1) return { ok: false, reason: 'tx failed on chain' };
+
+    // Find USDC Transfer log: Transfer(from, to=OWNER_WALLET, amount)
+    const ownerLower = OWNER_WALLET_ADDRESS.toLowerCase();
+    const usdcLower = USDC_ADDRESS.toLowerCase();
+
+    const log = receipt.logs.find(l =>
+      l.address.toLowerCase() === usdcLower &&
+      l.topics[0] === TRANSFER_TOPIC &&
+      l.topics.length === 3 &&
+      ('0x' + l.topics[2].slice(26)).toLowerCase() === ownerLower
+    );
+
+    if (!log) return { ok: false, reason: 'no matching USDC Transfer to owner' };
+
+    // Decode amount (USDC has 6 decimals)
+    const amount = BigInt(log.data);
+    const expectedRaw = BigInt(Math.round(expectedPriceUsdc * 1e6));
+
+    if (amount < expectedRaw) {
+      return { ok: false, reason: `amount too low: got ${amount}, expected ${expectedRaw}` };
+    }
+
+    usedTxHashes.add(txHash);
+    return { ok: true };
+  } catch (err) {
+    console.error('[payment] on-chain verify error:', err.message);
+    // Fail open in dev, fail closed in prod
+    return { ok: false, reason: `rpc error: ${err.message}` };
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -218,7 +289,7 @@ app.get('/pixel/:x/:y', (req, res) => {
  *
  * TODO: Redis — atomic Lua script for HGET + HSET + LPUSH ledger
  */
-app.post('/pixel/:x/:y', (req, res) => {
+app.post('/pixel/:x/:y', async (req, res) => {
   const { valid, x, y } = validateCoords(req.params.x, req.params.y);
   if (!valid) {
     return res.status(400).json({ error: 'Coordinates out of range (0–999)' });
@@ -275,9 +346,10 @@ app.post('/pixel/:x/:y', (req, res) => {
   // ── STEP 2: Validate payment and execute pixel claim ──
   const paymentProof = parsePaymentHeader(paymentHeader);
 
-  if (!verifyPayment(paymentProof, price_usdc)) {
+  const verification = await verifyPaymentOnChain(paymentProof, price_usdc);
+  if (!verification.ok) {
     return res.status(402).json({
-      error: 'Invalid payment proof. Please retry with valid X-PAYMENT header.',
+      error: `Invalid payment: ${verification.reason}`,
       x402Version: 1,
     });
   }
