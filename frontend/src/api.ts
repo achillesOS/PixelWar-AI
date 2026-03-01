@@ -1,6 +1,6 @@
 import type { ApiResponse, Pixel, Stats, AgentStat } from './types';
 
-const API_BASE = 'http://localhost:3001';
+const API_BASE = import.meta.env.VITE_API_URL ?? 'https://pixelwar-ai.onrender.com';
 
 // ─── Mock Data Generator ──────────────────────────────────────────────────────
 
@@ -87,9 +87,54 @@ export function buildMockStats(pixels: Pixel[]): Stats {
 // ─── Real API Fetch ───────────────────────────────────────────────────────────
 
 async function fetchFromApi(): Promise<ApiResponse> {
-  const res = await fetch(`${API_BASE}/pixels`, { signal: AbortSignal.timeout(3000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json() as Promise<ApiResponse>;
+  const [pixelsRes, statsRes] = await Promise.all([
+    fetch(`${API_BASE}/pixels?limit=10000`, { signal: AbortSignal.timeout(8000) }),
+    fetch(`${API_BASE}/stats`, { signal: AbortSignal.timeout(8000) }),
+  ]);
+  if (!pixelsRes.ok) throw new Error(`/pixels HTTP ${pixelsRes.status}`);
+
+  const pixelsData = await pixelsRes.json();
+  const statsData = statsRes.ok ? await statsRes.json() : null;
+
+  // Normalize backend pixel shape → frontend Pixel type
+  // Backend: { x, y, owner, color, price (USDC float), timestamp (ms) }
+  // Frontend: { x, y, owner, color, price (raw int), updatedAt (ms) }
+  const pixels: Pixel[] = (pixelsData.pixels ?? []).map((p: any) => ({
+    x: p.x,
+    y: p.y,
+    color: p.color ?? '#888888',
+    price: Math.round((p.price ?? 0.001) * 1e6), // USDC → raw (6 decimals)
+    owner: p.owner ?? 'unknown',
+    updatedAt: p.timestamp ?? Date.now(),
+  }));
+
+  // Normalize stats
+  let stats: Stats;
+  if (statsData) {
+    const topExpensive: Pixel[] = statsData.most_expensive
+      ? [{
+          x: statsData.most_expensive.x,
+          y: statsData.most_expensive.y,
+          color: statsData.most_expensive.color ?? '#888888',
+          price: Math.round((statsData.most_expensive.price ?? 0) * 1e6),
+          owner: statsData.most_expensive.owner ?? 'unknown',
+          updatedAt: statsData.most_expensive.timestamp ?? Date.now(),
+        }]
+      : pixels.slice(0, 5).sort((a, b) => b.price - a.price);
+
+    stats = {
+      totalClaimed: statsData.total_occupied ?? pixels.length,
+      totalPixels: 1_000_000,
+      topExpensive,
+      topAgents: statsData.most_active
+        ? [{ agentId: statsData.most_active.agent_id, pixelCount: statsData.most_active.tx_count, totalValue: 0 }]
+        : [],
+    };
+  } else {
+    stats = buildMockStats(pixels);
+  }
+
+  return { pixels, stats };
 }
 
 // ─── Main Data Fetch (with mock fallback) ─────────────────────────────────────

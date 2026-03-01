@@ -1,7 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react';
-import * as PIXI from 'pixi.js';
 import type { PixelMap, SelectedPixel } from '../types';
-import { colorToHex } from '../hooks/usePixelData';
 
 interface PixelCanvasProps {
   pixelMap: PixelMap;
@@ -9,127 +7,136 @@ interface PixelCanvasProps {
 }
 
 const GRID_SIZE = 1000;
-const PIXEL_SIZE = 1; // 1 logical pixel per cell at scale=1
 
-// Clamp helpers
 function clamp(v: number, min: number, max: number) {
   return Math.max(min, Math.min(max, v));
 }
 
+function hexToRgb(color: string): string {
+  return color || '#1a1a2e';
+}
+
 export function PixelCanvas({ pixelMap, onPixelSelect }: PixelCanvasProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const appRef = useRef<PIXI.Application | null>(null);
-  const stageContainerRef = useRef<PIXI.Container | null>(null);
-  const pixelsGraphicsRef = useRef<PIXI.Graphics | null>(null);
-  const gridGraphicsRef = useRef<PIXI.Graphics | null>(null);
-  const bgGraphicsRef = useRef<PIXI.Graphics | null>(null);
   const pixelMapRef = useRef<PixelMap>({});
+  const viewRef = useRef({ x: 0, y: 0, scale: 1 });
   const isDragging = useRef(false);
   const lastPos = useRef({ x: 0, y: 0 });
   const hasMoved = useRef(false);
+  const rafRef = useRef<number | null>(null);
 
-  // Draw all pixels onto the Graphics object
-  const drawPixels = useCallback((g: PIXI.Graphics, map: PixelMap) => {
-    g.clear();
+  // Draw everything onto Canvas 2D
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const { x, y, scale } = viewRef.current;
+    const w = canvas.width;
+    const h = canvas.height;
+
+    // Background
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, w, h);
+
+    // Canvas area background
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(x, y, GRID_SIZE * scale, GRID_SIZE * scale);
+
+    // Pixels
+    const map = pixelMapRef.current;
     for (const key in map) {
       const px = map[key];
-      g.beginFill(colorToHex(px.color), 1);
-      g.drawRect(px.x * PIXEL_SIZE, px.y * PIXEL_SIZE, PIXEL_SIZE, PIXEL_SIZE);
-      g.endFill();
+      ctx.fillStyle = hexToRgb(px.color);
+      ctx.fillRect(
+        x + px.x * scale,
+        y + px.y * scale,
+        Math.max(1, scale),
+        Math.max(1, scale)
+      );
     }
+
+    // Grid lines (only when zoomed in enough)
+    if (scale >= 8) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      const startX = Math.max(0, Math.floor(-x / scale));
+      const endX = Math.min(GRID_SIZE, Math.ceil((w - x) / scale));
+      const startY = Math.max(0, Math.floor(-y / scale));
+      const endY = Math.min(GRID_SIZE, Math.ceil((h - y) / scale));
+
+      for (let i = startX; i <= endX; i++) {
+        ctx.moveTo(x + i * scale, y + startY * scale);
+        ctx.lineTo(x + i * scale, y + endY * scale);
+      }
+      for (let j = startY; j <= endY; j++) {
+        ctx.moveTo(x + startX * scale, y + j * scale);
+        ctx.lineTo(x + endX * scale, y + j * scale);
+      }
+      ctx.stroke();
+    }
+
+    // Border around canvas
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, GRID_SIZE * scale, GRID_SIZE * scale);
   }, []);
 
-  // Draw subtle grid lines (only when scale is large enough)
-  const drawGrid = useCallback((g: PIXI.Graphics, scale: number) => {
-    g.clear();
-    if (scale < 8) return; // don't draw grid when too zoomed out
+  const scheduleDraw = useCallback(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(draw);
+  }, [draw]);
 
-    g.lineStyle(0.5 / scale, 0x333333, 0.5);
-    for (let i = 0; i <= GRID_SIZE; i++) {
-      g.moveTo(i * PIXEL_SIZE, 0);
-      g.lineTo(i * PIXEL_SIZE, GRID_SIZE * PIXEL_SIZE);
-      g.moveTo(0, i * PIXEL_SIZE);
-      g.lineTo(GRID_SIZE * PIXEL_SIZE, i * PIXEL_SIZE);
-    }
-  }, []);
-
-  // Initialize PIXI app
+  // Setup canvas and events
   useEffect(() => {
-    const div = containerRef.current;
-    if (!div) return;
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
 
-    const w = div.clientWidth;
-    const h = div.clientHeight;
+    const resize = () => {
+      canvas.width = container.clientWidth;
+      canvas.height = container.clientHeight;
+      // Init view: fit grid in center
+      const s = Math.min(canvas.width, canvas.height) / GRID_SIZE;
+      viewRef.current = {
+        scale: s,
+        x: (canvas.width - GRID_SIZE * s) / 2,
+        y: (canvas.height - GRID_SIZE * s) / 2,
+      };
+      scheduleDraw();
+    };
 
-    const app = new PIXI.Application({
-      width: w,
-      height: h,
-      backgroundColor: 0x0a0a0a,
-      antialias: false,
-      resolution: window.devicePixelRatio || 1,
-      autoDensity: true,
-    });
+    resize();
 
-    div.appendChild(app.view as HTMLCanvasElement);
-    appRef.current = app;
+    const ro = new ResizeObserver(resize);
+    ro.observe(container);
 
-    // Stage container (for pan/zoom)
-    const stage = new PIXI.Container();
-    app.stage.addChild(stage);
-    stageContainerRef.current = stage;
-
-    // Initial scale/position: fit the 1000x1000 grid
-    const initScale = Math.min(w, h) / GRID_SIZE;
-    stage.scale.set(initScale);
-    stage.position.set(
-      (w - GRID_SIZE * initScale) / 2,
-      (h - GRID_SIZE * initScale) / 2,
-    );
-
-    // Background layer
-    const bg = new PIXI.Graphics();
-    bg.beginFill(0x1a1a2e, 1);
-    bg.drawRect(0, 0, GRID_SIZE, GRID_SIZE);
-    bg.endFill();
-    stage.addChild(bg);
-    bgGraphicsRef.current = bg;
-
-    // Pixel layer
-    const pixelsG = new PIXI.Graphics();
-    stage.addChild(pixelsG);
-    pixelsGraphicsRef.current = pixelsG;
-
-    // Grid layer
-    const gridG = new PIXI.Graphics();
-    stage.addChild(gridG);
-    gridGraphicsRef.current = gridG;
-
-    // ─── Mouse wheel zoom ──────────────────────────────────────────────────
-    const canvas = app.view as HTMLCanvasElement;
-
+    // Wheel zoom
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-      const newScale = clamp(stage.scale.x * factor, 0.1, 100);
+      const v = viewRef.current;
+      const newScale = clamp(v.scale * factor, 0.1, 100);
 
-      // Zoom towards cursor position
       const rect = canvas.getBoundingClientRect();
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
 
-      const worldX = (mouseX - stage.x) / stage.scale.x;
-      const worldY = (mouseY - stage.y) / stage.scale.y;
+      const worldX = (mx - v.x) / v.scale;
+      const worldY = (my - v.y) / v.scale;
 
-      stage.scale.set(newScale);
-      stage.x = mouseX - worldX * newScale;
-      stage.y = mouseY - worldY * newScale;
-
-      drawGrid(gridGraphicsRef.current!, newScale);
+      viewRef.current = {
+        scale: newScale,
+        x: mx - worldX * newScale,
+        y: my - worldY * newScale,
+      };
+      scheduleDraw();
     };
 
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-
-    // ─── Pan (drag) ────────────────────────────────────────────────────────
+    // Pan
     const onMouseDown = (e: MouseEvent) => {
       if (e.button !== 0) return;
       isDragging.current = true;
@@ -143,9 +150,10 @@ export function PixelCanvas({ pixelMap, onPixelSelect }: PixelCanvasProps) {
       const dx = e.clientX - lastPos.current.x;
       const dy = e.clientY - lastPos.current.y;
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) hasMoved.current = true;
-      stage.x += dx;
-      stage.y += dy;
+      viewRef.current.x += dx;
+      viewRef.current.y += dy;
       lastPos.current = { x: e.clientX, y: e.clientY };
+      scheduleDraw();
     };
 
     const onMouseUp = (e: MouseEvent) => {
@@ -155,16 +163,12 @@ export function PixelCanvas({ pixelMap, onPixelSelect }: PixelCanvasProps) {
       canvas.style.cursor = 'crosshair';
 
       if (!wasDragging) {
-        // It was a click — find which pixel
         const rect = canvas.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-
-        const worldX = (mouseX - stage.x) / stage.scale.x;
-        const worldY = (mouseY - stage.y) / stage.scale.y;
-
-        const px = Math.floor(worldX / PIXEL_SIZE);
-        const py = Math.floor(worldY / PIXEL_SIZE);
+        const v = viewRef.current;
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const px = Math.floor((mx - v.x) / v.scale);
+        const py = Math.floor((my - v.y) / v.scale);
 
         if (px >= 0 && px < GRID_SIZE && py >= 0 && py < GRID_SIZE) {
           const key = `${px},${py}`;
@@ -172,14 +176,7 @@ export function PixelCanvas({ pixelMap, onPixelSelect }: PixelCanvasProps) {
           if (found) {
             onPixelSelect(found);
           } else {
-            onPixelSelect({
-              x: px, y: py,
-              color: '#1a1a2e',
-              price: 0,
-              owner: '(unclaimed)',
-              updatedAt: 0,
-              isEmpty: true,
-            });
+            onPixelSelect({ x: px, y: py, color: '#1a1a2e', price: 0, owner: '(unclaimed)', updatedAt: 0, isEmpty: true });
           }
         } else {
           onPixelSelect(null);
@@ -187,50 +184,31 @@ export function PixelCanvas({ pixelMap, onPixelSelect }: PixelCanvasProps) {
       }
     };
 
-    const onMouseLeave = () => {
-      isDragging.current = false;
-      canvas.style.cursor = 'crosshair';
-    };
-
+    canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('mousedown', onMouseDown);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
-    canvas.addEventListener('mouseleave', onMouseLeave);
     canvas.style.cursor = 'crosshair';
 
-    // ─── Resize observer ──────────────────────────────────────────────────
-    const resizeObserver = new ResizeObserver(() => {
-      const nw = div.clientWidth;
-      const nh = div.clientHeight;
-      app.renderer.resize(nw, nh);
-    });
-    resizeObserver.observe(div);
-
     return () => {
-      resizeObserver.disconnect();
+      ro.disconnect();
       canvas.removeEventListener('wheel', onWheel);
       canvas.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
-      canvas.removeEventListener('mouseleave', onMouseLeave);
-      app.destroy(true, { children: true });
-      appRef.current = null;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [scheduleDraw, onPixelSelect]);
 
-  // Update pixel graphics when data changes
+  // Redraw when pixelMap changes
   useEffect(() => {
     pixelMapRef.current = pixelMap;
-    const g = pixelsGraphicsRef.current;
-    if (!g) return;
-    drawPixels(g, pixelMap);
-  }, [pixelMap, drawPixels]);
+    scheduleDraw();
+  }, [pixelMap, scheduleDraw]);
 
   return (
-    <div
-      ref={containerRef}
-      style={{ width: '100%', height: '100%', overflow: 'hidden' }}
-    />
+    <div ref={containerRef} style={{ width: '100%', height: '100%', overflow: 'hidden', background: '#0a0a0a' }}>
+      <canvas ref={canvasRef} style={{ display: 'block' }} />
+    </div>
   );
 }
